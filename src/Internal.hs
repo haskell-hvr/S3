@@ -3,38 +3,26 @@
 
 -- |
 -- Copyright: © Herbert Valerio Riedel 2016-2018
--- SPDX-License-Identifier: GPL-2.0-or-later
+-- SPDX-License-Identifier: GPL-3.0-or-later
 --
 module Internal
     ( module Internal
-    , module Control.Applicative
-    , module Data.Maybe
-    , module Data.Semigroup
-    , module Data.Word
-    , module Data.Int
     , ByteString
     , ShortByteString
-    , HM.HashMap
+    , ShortText
     , Proxy(..)
-    , NFData
+    , NFData(rnf), force
     ) where
 
-import           Control.Applicative
 import           Control.DeepSeq
 import qualified Crypto.Hash.MD5        as MD5
 import           Data.ByteString        (ByteString)
 import qualified Data.ByteString        as BS
-import qualified Data.ByteString.Base16 as B16
-import           Data.Semigroup
--- import           Data.ByteString.Lazy (toStrict,fromStrict)
+import qualified Codec.Base16 as B16
+import           Data.Text.Short        (ShortText)
 import           Data.ByteString.Short  (ShortByteString, fromShort, toShort)
 import           Data.Hashable
-import qualified Data.HashMap.Strict    as HM
-import           Data.Int
-import           Data.Maybe
 import           Data.Proxy
-import           Data.String
-import           Data.Word
 
 newtype SHA256Val = SHA256Val ShortByteString
                   deriving (Eq,Ord,Hashable,NFData,Show)
@@ -56,9 +44,8 @@ md5hex (MD5Val x) = B16.encode (fromShort x)
 
 md5unhex :: ByteString -> Maybe MD5Val
 md5unhex x = case B16.decode x of
-    (d, rest) | BS.null rest, BS.length d == 16
-                -> Just (MD5Val (toShort d))
-    _           -> Nothing
+    Right d | BS.length d == 16 -> Just (MD5Val (toShort d))
+    _                           -> Nothing
 
 -- Special reserved 'SHA256Val'
 md5zero :: MD5Val
@@ -69,4 +56,6 @@ strictPair !a !b = (a,b)
 
 -- strictTriple :: a -> b -> c -> (a,b,c)
 -- strictTriple !a !b !c = (a,b,c)
+
+
 
