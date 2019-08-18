@@ -1,12 +1,29 @@
-{-# LANGUAGE BangPatterns               #-}
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE DeriveDataTypeable  #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
-{-# OPTIONS_GHC -Wno-deprecations #-}
+{-
+
+Copyright (c) 2016-2019  Herbert Valerio Riedel <hvr@gnu.org>
+
+ This file is free software: you may copy, redistribute and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation, either version 3 of the License, or (at your
+ option) any later version.
+
+ This file is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program (see `LICENSE`).  If not, see
+ <https://www.gnu.org/licenses/gpl-3.0.html>.
+
+-}
 
 -- |
 -- Copyright: © Herbert Valerio Riedel 2016-2019
@@ -14,7 +31,40 @@
 --
 -- Simple lightweight S3 API implementation
 --
--- This implementation has been tested succesfully against MinIO's, Dreamhost's, and Amazon's S3 server implementations
+-- This implementation has been tested succesfully against MinIO's, Dreamhost's, and AWS' S3 server implementations
+--
+-- == API Usage Example
+--
+-- The example below shows how to create, populate, list, and finally destroy a bucket again.
+--
+-- @
+--  -- demo credentials for http://play.min.io/
+--  let s3cfg = 'defaultS3Cfg' { 's3cfgBaseUrl' = \"https://play.min.io:9000\" }
+--      creds = 'Credentials' \"Q3AM3UQ867SPQQA43P2F\" \"zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG\"
+--
+--  -- we'll create this bucket and delete it again
+--  let testBucket = 'BucketId' "haskell-test-bucket-42"
+--
+--  'withConnection' s3cfg $ \conn -> do
+--    'createBucket' conn creds testBucket Nothing
+--
+--    etag1 <- 'putObject' conn creds testBucket ('ObjKey' \"folder\/file1\") \"content1\" (CType \"text\/plain\") Nothing
+--    etag2 <- 'putObject' conn creds testBucket ('ObjKey' \"file2\") \"content2\" (CType \"text\/plain\") Nothing
+--
+--    -- will list the key \"file2\" and the common-prefix \"folder\/\"
+--    print =<< 'listObjects' conn creds testBucket 'nullObjKey' (Just \'\/\')
+--    -- will list only the key \"folder\/file1\"
+--    print =<< 'listObjects' conn creds testBucket ('ObjKey' \"folder\/\") (Just \'\/\')
+--    -- will list the two keys \"folder\/file1\" and \"file2\" (and no common prefix)
+--    print =<< 'listObjects' conn creds testBucket 'nullObjKey' Nothing
+--
+--    -- ...and now we remove the two objects we created above
+--    'deleteObject' conn creds testBucket ('ObjKey' \"folder\/file1\")
+--    'deleteObject' conn creds testBucket ('ObjKey' \"file2\")
+--
+--    'deleteBucket' conn creds testBucket
+-- @
+--
 module Network.S3
     ( -- * Operations on Buckets
       BucketId(..)
@@ -22,7 +72,7 @@ module Network.S3
     , Acl(..)
 
     , listBuckets
-    , putBucket
+    , createBucket
     , deleteBucket
 
     , listObjects
@@ -38,6 +88,14 @@ module Network.S3
     , ObjMetaInfo(..)
     , CType(..), noCType
     , ETag(..)
+
+      -- *** MD5 hashes
+    , MD5Val
+    , md5hash
+    , md5hex
+    , md5unhex
+    , md5ToSBS
+    , md5FromSBS
 
       -- ** Operations
     , putObject
@@ -59,7 +117,8 @@ module Network.S3
     , Credentials(..), noCredentials
 
       -- * Connection handling
-    , S3Cfg(..)
+    , S3Cfg(..), defaultS3Cfg
+    , SignatureVersion(..)
 
     , Connection
     , withConnection
@@ -68,29 +127,23 @@ module Network.S3
     ) where
 
 import           Internal
+import           Network.S3.Signature
+import           Network.S3.Types
+import           Network.S3.XML
 
-import Text.Read (readMaybe)
-import Control.Monad
 import           Control.Concurrent
 import           Control.Exception
-import qualified Crypto.Hash.MD5         as MD5
-import qualified Crypto.Hash.SHA1        as SHA1
 import qualified Data.ByteString         as BS
-import qualified Codec.Base64  as B64
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Char8   as BC8
+import qualified Data.ByteString.Lazy    as BL
 import qualified Data.ByteString.Short   as BSS
-import qualified Data.ByteString.Lazy   as BL
 import           Data.Char
-import qualified Data.List               as List
-import qualified Data.Text.Short         as TS
 import qualified Data.Text               as T
-import qualified Data.Text.Encoding               as T
-import qualified Data.Text.Lazy.Encoding               as TL
-import           Data.Time               (UTCTime)
+import qualified Data.Text.IO            as T
+import qualified Data.Text.Lazy.Encoding as TL
+import qualified Data.Text.Short         as TS
 import           Data.Time.Clock         (getCurrentTime)
-import           Data.Time.Format        (defaultTimeLocale)
-import qualified Data.Time.Format        as DT
 import qualified Network.Http.Client     as HC
 import qualified System.IO.Streams       as Streams
 import qualified Text.XML                as X
@@ -99,8 +152,12 @@ import qualified Text.XML                as X
 data ProtocolError
      = ProtocolInconsistency String
      | HttpFailure !SomeException
-     | UnexpectedResponse {- code -} !Int {- message -} !ShortByteString {- content-type -} !ShortByteString {- body -} ByteString
-     deriving (Show, Typeable)
+     | UnexpectedResponse {- code -} !Int
+                       {- message -} !ShortByteString
+                  {- content-type -} !ShortByteString
+                          {- body -} BL.ByteString
+     deriving (Show, Typeable, Generic)
+
 instance Exception ProtocolError
 
 -- | S3-level errors
@@ -113,9 +170,13 @@ data ErrorCode
      | NoSuchBucket
      | NoSuchKey
      | InvalidArgument
+     | InvalidDigest
+     | SignatureDoesNotMatch
      | UnknownError !ShortText
-     deriving (Show, Typeable)
+     deriving (Show, Typeable, Generic)
+
 instance Exception ErrorCode
+instance NFData ErrorCode
 
 errorToErrorCode :: Error -> ErrorCode
 errorToErrorCode (Error x) = case x of
@@ -127,78 +188,85 @@ errorToErrorCode (Error x) = case x of
     "NoSuchBucket"            -> NoSuchBucket
     "NoSuchKey"               -> NoSuchKey
     "InvalidArgument"         -> InvalidArgument
+    "InvalidDigest"           -> InvalidDigest
+    "SignatureDoesNotMatch"   -> SignatureDoesNotMatch
     _                         -> UnknownError x
 
--- | Content-type
-newtype CType = CType ShortText
-              deriving Show
+urlEncodeObjKey, urlEncodeObjKeyQry :: ObjKey -> ByteString
+urlEncodeObjKey = urlEncode False . TS.toByteString . unObjKey
+urlEncodeObjKeyQry = urlEncode True . TS.toByteString . unObjKey
 
--- | Unspecified 'CType'
-noCType :: CType
-noCType = CType mempty
+s3'ObjKey :: X.LName -> Bool -> X.Element -> Either String ObjKey
+s3'ObjKey ln False el = ObjKey <$> xsd'string (s3qname ln) el
+s3'ObjKey ln True el = do
+  s <- xsd'string (s3qname ln) el
+  case TS.fromText <$> urlDecodeTextUtf8 s of
+    Just s' -> pure (ObjKey s')
+    Nothing -> Left ("<" <> showQN (X.elName el) <> "> failed to url-decode ObjKey")
 
-data S3Cfg = S3Cfg
-    { s3cfgBaseUrl :: !HC.URL -- ^ Service endpoint (i.e without 'BucketId'); Only scheme, host and port are used currently
-    }
+objUrlPath :: BucketId -> ObjKey -> UrlPath
+objUrlPath (BucketId bucketId) objkey = "/" <> BSS.fromShort bucketId <> "/" <> urlEncodeObjKey objkey
 
--- | S3 Credentials
---
--- We use memory pinned 'ByteString's because we don't want to have the credential data copied around more than necessary.
-data Credentials = Credentials
-    { s3AccessKey :: !ByteString -- ^ 'mempty' denotes anonymous access (see also 'noCredentials')
-    , s3SecretKey :: !ByteString
-    }
+bucketUrlPath :: BucketId -> UrlPath
+bucketUrlPath (BucketId bucketId) = "/" <> BSS.fromShort bucketId
 
--- | Anonymous access
-noCredentials :: Credentials
-noCredentials = Credentials "" ""
+withAWSHeaders :: Connection -> (AWSHeaders -> IO b) -> IO b
+withAWSHeaders conn cont = do
+  now <- getCurrentTime
 
--- | S3 Bucket identifier
---
---
-newtype BucketId = BucketId ShortByteString    -- ^ Must be valid as DNS name component; S3 provider may have additional restrictions (see e.g. AWS S3's <https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html#bucketnamingrules "Rules for Bucket Naming">)
-                 deriving (Eq,Ord,Show,NFData,XsdString)
+  cont AWSHeaders
+         { ahdrMethod        = HC.GET
+         , ahdrUrlPath       = "/"
+         , ahdrUrlQuery      = mempty
+         , ahdrTimestamp     = now
+         , ahdrContentType   = noCType
+         , ahdrContentHashes = Nothing
+         , ahdrExtraHeaders  = []
+         , ahdrSigType       = s3cfgSigVersion $ s3connCfg conn
+         , ahdrHost          = s3connHost conn
+         , ahdrRegion        = s3cfgRegion $ s3connCfg conn
+         }
 
 -- | List buckets owned by user
 listBuckets :: Connection
             -> Credentials
-            -> IO ([BucketInfo])
-listBuckets conn creds = do
-    now <- getCurrentTime
-
+            -> IO [BucketInfo]
+listBuckets conn creds = withAWSHeaders conn $ \awsh -> do
     let q = HC.buildRequest1 $
-              setAWSHeaders HC.GET (BucketId "",nullObjKey,"") ("",noCType,now) [] creds
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.GET
+                , ahdrUrlPath       = "/"
+                }
 
     (resp,mtmp) <- doHttpReqXml conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       200 -> pure ()
-      403 -> throwIO AccessDenied
-      _   -> throwUnexpectedXmlResp resp (fromMaybe dummyEl mtmp)
+      _   -> throwUnexpectedXmlResp resp mtmp
 
     case maybe (Left "empty body") parseXML mtmp of
       Right (ListAllMyBucketsResult bs) -> pure bs
       Left err -> throwProtoFail $ "ListAllMyBucketsResult: " <> err
 
 -- | Create bucket
-putBucket :: Connection
-          -> Credentials
-          -> BucketId
-          -> Maybe Acl
-          -> IO ()
-putBucket conn creds bid macl = do
-    now <- getCurrentTime
-
-    let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.PUT (bid,nullObjKey,mempty) ("",noCType,now) hdrs creds
-              HC.setContentLength 0
+createBucket :: Connection
+             -> Credentials
+             -> BucketId
+             -> Maybe Acl
+             -> IO ()
+createBucket conn creds bid macl = withAWSHeaders conn $ \awsh -> do
+    let q = HC.buildRequest1 $
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.PUT
+                , ahdrUrlPath       = bucketUrlPath bid
+                , ahdrExtraHeaders  = hdrs
+                }
 
     (resp, mtmp) <- doHttpReqXml conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       200 -> pure ()
-      403 -> throwIO AccessDenied
-      _   -> throwUnexpectedXmlResp resp (fromMaybe dummyEl mtmp)
+      _   -> throwUnexpectedXmlResp resp mtmp
   where
     hdrs = case macl of
              Nothing  -> []
@@ -206,181 +274,108 @@ putBucket conn creds bid macl = do
 
 -- | Delete bucket
 --
--- __NOTE__: Many S3 implementations require the bucket to be empty before it can be deleted
+-- __NOTE__: Most S3 implementations require the bucket to be empty before it can be deleted. See documentation of 'listObjectsFold' for a code example deleting a non-empty bucket.
 deleteBucket :: Connection
                -> Credentials
                -> BucketId
                -> IO ()
-deleteBucket conn creds bid = do
-    now <- getCurrentTime
-
-    let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.DELETE (bid,nullObjKey,mempty) (mempty,noCType,now) [] creds
+deleteBucket conn creds bid = withAWSHeaders conn $ \awsh -> do
+    let q = HC.buildRequest1 $
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.DELETE
+                , ahdrUrlPath       = bucketUrlPath bid
+                }
 
     (resp, mtmp) <- doHttpReqXml conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       204 -> pure ()
-      403 -> throwIO AccessDenied
-      _   -> throwUnexpectedXmlResp resp (fromMaybe dummyEl mtmp)
+      _   -> throwUnexpectedXmlResp resp mtmp
 
     pure ()
-
-
--- | The name for a key is a sequence of Unicode characters whose UTF-8 encoding is at most 1024 bytes long.
---
--- See also AWS S3's documentation on <https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html "Object Key and Metadata">
-newtype ObjKey = ObjKey ShortText
-               deriving (Show,Eq,Ord,NFData)
-
-unObjKey :: ObjKey -> ShortText
-unObjKey (ObjKey k) = k
-
-nullObjKey :: ObjKey
-nullObjKey = ObjKey mempty
-
-isNullObjKey :: ObjKey -> Bool
-isNullObjKey = TS.null . unObjKey
-
-data ETag = ETag !ShortByteString
-          | ETagMD5 !MD5Val
-          deriving (Show,Eq,Ord)
-
-instance NFData ETag where
-  rnf !_ = ()
-
-{-
-
-entity-tag = [ weak ] opaque-tag
-     weak       = %x57.2F ; "W/", case-sensitive
-     opaque-tag = DQUOTE *etagc DQUOTE
-     etagc      = %x21 / %x23-7E / obs-text
-                ; VCHAR except double quotes, plus obs-text
-     obs-text   = %x80-FF
--}
-
-etagToBS :: ETag -> ByteString
-etagToBS (ETag etag)   = BSS.fromShort etag
-etagToBS (ETagMD5 md5) = mconcat [ "\"", md5hex md5, "\"" ]
-
-mkETag :: ByteString -> ETag
-mkETag bs
-  | BS.length bs == 34, BC8.head bs == '"', BC8.last bs == '"'
-  , BC8.all (\c -> isHexDigit c && not (isUpper c)) (BS.init (BS.tail bs))
-  , Just md5 <- md5unhex (BS.init (BS.tail bs)) = ETagMD5 md5
-
-  | otherwise = ETag (BSS.toShort bs)
-
-
--- | Conditional Request
---
--- Note that S3 server implementations vary in their support for
--- conditional requests
---
-data Condition = IfExists         -- ^ @If-Match: *@
-               | IfNotExists      -- ^ @If-None-Match: *@
-               | IfMatch !ETag    -- ^ @If-Match: ...@
-               | IfNotMatch !ETag -- ^ @If-None-Match: ...@
-
-setConditionHeader :: Condition -> HC.RequestBuilder ()
-setConditionHeader cond = case cond of
-  IfExists        -> HC.setHeader "If-Match" "*"
-  IfNotExists     -> HC.setHeader "If-None-Match" "*"
-  IfMatch  etag   -> HC.setHeader "If-Match" (etagToBS etag)
-  IfNotMatch etag -> HC.setHeader "If-None-Match" (etagToBS etag)
-
-
-data ObjMetaInfo = OMI
-    { omiKey          :: !ObjKey
-    , omiEtag         :: !ETag
-    , omiSize         :: !Int64
-    , omiOwnerId      :: !(Maybe ShortText)
-    , omiLastModified :: !UTCTime
-    } deriving (Eq,Ord,Show)
-
-instance NFData ObjMetaInfo where rnf !_ = ()
-
-urlEncodeObjKey :: ObjKey -> ByteString
-urlEncodeObjKey = BC8.concatMap go . TS.toByteString . unObjKey
-  where
-    go c | inRng '0' '9' c ||
-           inRng 'a' 'z' c ||
-           inRng 'A' 'Z' c ||
-           c `elem` ['-','_','.','~'] = BC8.singleton c
-
-         | otherwise = let (h,l) = quotRem (fromIntegral $ fromEnum c) 0x10
-                       in BS.pack [0x25, hex h, hex l]
-
-    inRng x y c = c >= x && c <= y
-
-    hex j | j < 10    = 0x30 + j
-          | otherwise = 0x37 + j
 
 ----------------------------------------------------------------------------
 
 -- | Represents a single-threaded HTTP channel to the S3 service
-data Connection = S3Conn (MVar HC.Connection) !S3Cfg
+data Connection = S3Conn (MVar HC.Connection) !ByteString !S3Cfg
+
+s3connCfg :: Connection -> S3Cfg
+s3connCfg (S3Conn _ _ cfg) = cfg
+
+s3connHost :: Connection -> ByteString
+s3connHost (S3Conn _ h _) = h
 
 -- | Simple single-connection 'bracket' style combinator over 'connect' and 'close'
 --
 -- If you need resource pool management you can use 'connect' in combination with packages such as [resource-pool](http://hackage.haskell.org/package/resource-pool).
 withConnection :: S3Cfg -> (Connection -> IO a) -> IO a
-withConnection cfg@S3Cfg{..} act = HC.withConnection (HC.establishConnection s3cfgBaseUrl) $ \c -> do
-  c' <- newMVar c
-  act (S3Conn c' cfg)
+withConnection cfg@S3Cfg{..} = bracket (connect cfg) close
 
+-- | Create HTTP(s) connection based on 'S3Cfg'
 connect :: S3Cfg -> IO Connection
 connect cfg@S3Cfg{..} = do
-  c' <- newMVar =<< HC.establishConnection s3cfgBaseUrl
-  pure (S3Conn c' cfg)
+  c  <- HC.establishConnection s3cfgBaseUrl
+  c' <- newMVar c
+  pure (S3Conn c' (cHost c) cfg)
 
+-- | Close connection constructed via 'connect'
 close :: Connection -> IO ()
-close (S3Conn cref _) = withMVar cref $ \c -> do
-  HC.closeConnection c
+close (S3Conn cref _ _) = withMVar cref HC.closeConnection
 
-debugHttp :: Bool
-debugHttp = True
+cHost :: HC.Connection -> ByteString
+cHost c = HC.getHostname c (HC.buildRequest1 (pure ()))
 
--- is4xx :: HC.StatusCode -> Bool
--- is4xx sc = 400 <= sc && sc < 500
 
 -- low-level helper
-doHttpReq :: Connection -> HC.Request -> (Streams.OutputStream Builder.Builder -> IO ()) -> IO (HC.Response, ByteString)
-doHttpReq (S3Conn cref S3Cfg{..}) q body = withMVar cref $ \c -> do
+doHttpReq :: Bool -> Connection -> HC.Request
+          -> (Streams.OutputStream Builder.Builder -> IO ())
+          -> IO (HC.Response, BL.ByteString)
+doHttpReq isProtocol (S3Conn cref _ S3Cfg{..}) q body = withMVar cref $ \c -> do
+    when s3cfgDebug $ do
+      BS.putStrLn sep1
+      T.putStr (T.pack $ show q)
+      BS.putStrLn sep2
+
     (resp,bs) <- handle exh $ do
       () <- HC.sendRequest c q body
       HC.receiveResponse c concatHandler
 
-    when debugHttp $ do
-      putStrLn "============================================================================"
-      print q
-      putStrLn "----------------------------------------------------------------------------"
-      print resp
-      BS.putStrLn bs
-      -- BS.writeFile "response.xml" bs
-      putStrLn "============================================================================"
+    when s3cfgDebug $ do
+      T.putStr (T.pack $ show resp)
+      unless (BL.null bs) $ do
+        BS.putStrLn sep2
+        if isProtocol || HC.getStatusCode resp /= 200
+          then BL.putStrLn bs
+          else T.putStrLn (T.pack $ "[non-protocol body with size=" <> show (BL.length bs) <> "]")
+      BS.putStrLn sep3
 
     pure (resp, bs)
   where
+    sep1 = "/==========================================================================\\"
+    sep2 = "----------------------------------------------------------------------------"
+    sep3 = "\\==========================================================================/"
+
     exh ex = throwIO (HttpFailure ex)
 
-    concatHandler :: HC.Response -> Streams.InputStream ByteString -> IO (HC.Response,ByteString)
-    concatHandler p i = (,) p <$> HC.concatHandler p i
+    concatHandler :: HC.Response -> Streams.InputStream ByteString -> IO (HC.Response,BL.ByteString)
+    concatHandler res i1 = do
+      xs <- Streams.toList i1
+      return (res, BL.fromChunks xs)
 
 doHttpReqXml :: Connection -> HC.Request
              -> (Streams.OutputStream Builder.Builder -> IO ())
              -> IO (HC.Response, Maybe X.Element)
 doHttpReqXml cn rq body = do
-  (resp,bs) <- doHttpReq cn rq body
+  (resp,bs) <- doHttpReq True cn rq body
 
   case fromMaybe mempty $ HC.getHeader resp "content-type" of
     ct | isXmlMimeType ct -> do
-           txt <- either (\_ -> throwProtoFail "failed to decode UTF-8 content from server") pure (T.decodeUtf8' bs)
+           txt <- either (\_ -> throwProtoFail "failed to decode UTF-8 content from server") pure (TL.decodeUtf8' bs)
            case X.parseXMLRoot txt of
              Left _  -> throwProtoFail "received malformed XML response from server"
              Right x -> pure (resp,Just $! X.rootElement x)
        | HC.getStatusCode resp == 204 -> pure (resp, Nothing)
-       | HC.getStatusCode resp == 200, BS.null bs -> pure (resp, Nothing)
+       | HC.getStatusCode resp == 200, BL.null bs -> pure (resp, Nothing)
        | otherwise -> throwUnexpectedResp resp bs
 
 
@@ -398,9 +393,9 @@ isXmlMimeType bs = case type_subtype of
   where
     type_subtype = BC8.map toLower $ BC8.takeWhile (not . \c -> isSpace c || c == ';') bs
 
-throwUnexpectedResp :: HC.Response -> ByteString -> IO a
-throwUnexpectedResp resp bs = do
-    case maybe mempty id $ HC.getHeader resp "Content-Type" of
+throwUnexpectedResp :: HC.Response -> BL.ByteString -> IO a
+throwUnexpectedResp resp bs
+  = case fromMaybe mempty $ HC.getHeader resp "Content-Type" of
       ct | isXmlMimeType ct
          , Right e <- decodeXML bs -> throwIO $! errorToErrorCode e
          | otherwise -> genEx ct
@@ -409,12 +404,17 @@ throwUnexpectedResp resp bs = do
     genEx ct = throwIO $! UnexpectedResponse (HC.getStatusCode resp) (BSS.toShort $ HC.getStatusMessage resp) (BSS.toShort ct) bs
 
 
-throwUnexpectedXmlResp :: HC.Response -> X.Element -> IO a
-throwUnexpectedXmlResp resp x = case parseXML x of
+throwUnexpectedXmlResp :: HC.Response -> Maybe X.Element -> IO a
+throwUnexpectedXmlResp resp Nothing
+  = throwIO $! UnexpectedResponse (HC.getStatusCode resp)
+                                  (BSS.toShort $ HC.getStatusMessage resp)
+                                  (maybe mempty BSS.toShort $ HC.getHeader resp "Content-Type")
+                                  mempty
+throwUnexpectedXmlResp resp (Just x) = case parseXML x of
     Right e -> throwIO $! errorToErrorCode e
     Left _  -> genEx
   where
-    genEx = throwIO $! UnexpectedResponse (HC.getStatusCode resp) (BSS.toShort $ HC.getStatusMessage resp) "application/xml" (BL.toStrict $ TL.encodeUtf8 (X.serializeXMLDoc x))
+    genEx = throwIO $! UnexpectedResponse (HC.getStatusCode resp) (BSS.toShort $ HC.getStatusMessage resp) "application/xml" (TL.encodeUtf8 (X.serializeXMLDoc x))
 
 throwProtoFail :: String -> IO a
 throwProtoFail = throwIO . ProtocolInconsistency
@@ -466,9 +466,8 @@ listObjects :: Connection
             -> Credentials
             -> BucketId
             -> ObjKey -- ^ prefix
-            -> Maybe Char -- ^ delim
-            -> IO ([ObjMetaInfo],[ObjKey])
-
+            -> Maybe Char -- ^ delimiter
+            -> IO ([ObjMetaInfo],[ObjKey]) -- ^ @(objects, prefixes)@
 listObjects conn creds bid pfx delim = go nullObjKey [] []
   where
     go marker acc1 acc2 = do
@@ -479,16 +478,32 @@ listObjects conn creds bid pfx delim = go nullObjKey [] []
         _ | isNullObjKey marker' -> pure (acc1', acc2')
           | otherwise            -> go marker' acc1' acc2'
 
-listObjectsFold :: Connection -> Credentials -> BucketId -> ObjKey -> Maybe Char
-                -> a -> (a -> [ObjMetaInfo] -> [ObjKey] -> IO a)
-                -> IO (Maybe a)
-listObjectsFold conn creds bid pfx delim acc0 lbody = go nullObjKey acc0
+-- | Convenient 'foldM'-like object listing operation
+--
+-- Here's an usage example for iterating over the list of objects in
+-- chunks of 100 objects and deleting those; and finally deleting the bucket:
+--
+-- > destroyBucket conn creds bid = do
+-- >   listObjectsFold conn creds bid nullObjKey Nothing 100 () $ \() objs [] ->
+-- >     forM_ objs $ \omi -> deleteObject conn creds bid (omiKey omi)
+-- >   deleteBucket conn creds bid
+--
+listObjectsFold :: Connection
+                -> Credentials
+                -> BucketId
+                -> ObjKey -- ^ prefix
+                -> Maybe Char -- ^ delimiter
+                -> Word16 -- ^ max number of keys per iteration
+                -> a -- ^ initial value of accumulator argument to folding function
+                -> (a -> [ObjMetaInfo] -> [ObjKey] -> IO a) -- ^ folding function
+                -> IO a -- ^ returns final value of accumulator value
+listObjectsFold conn creds bid pfx delim maxKeys acc0 lbody = go nullObjKey acc0
   where
     go marker acc = do
-      (marker', objs, pfxs) <- listObjectsChunk conn creds bid pfx delim marker 0
+      (marker', objs, pfxs) <- listObjectsChunk conn creds bid pfx delim marker maxKeys
       acc' <- lbody acc objs pfxs
       case () of
-        _ | isNullObjKey marker' -> pure Nothing
+        _ | isNullObjKey marker' -> pure acc'
           | otherwise            -> go marker' acc'
 
 {-
@@ -542,42 +557,56 @@ data MetadataEntry = MetadataEntry {-key-} ShortText {-value-} ShortText
 pMetadataEntry :: P MetadataEntry
 pMetadataEntry = MetadataEntry <$> one (s3_xsd'string "Name") <*> one (s3_xsd'string "Value")
 
-
 data ListBucketResult = LBR
-  { lbrMetadata       :: [MetadataEntry]
-  , lbrName           :: BucketId
-  , lbrPrefix         :: ObjKey
-  , lbrMarker         :: ObjKey
-  , lbrNextMarker     :: Maybe ObjKey
-  , lbrMaxKeys        :: Int32
-  , lbrDelimiter      :: Maybe Char
-  , lbrIsTruncated    :: Bool
-  , lbrEncodingType   :: Maybe ShortText
-  , lbrContents       :: [ObjMetaInfo]
-  , lbrCommonPrefixes :: [ObjKey]
+  { lbrMetadata        :: [MetadataEntry]
+  , lbrName            :: BucketId
+  , lbrPrefix          :: ObjKey
+  , lbrMarker          :: ObjKey
+  , lbrNextMarker      :: Maybe ObjKey
+  , lbrMaxKeys         :: Int32
+  , lbrDelimiter       :: Maybe Char
+  , lbrIsTruncated     :: Bool
+  , lbrEncodingTypeUrl:: Bool
+  , lbrContents        :: [ObjMetaInfo]
+  , lbrCommonPrefixes  :: [ObjKey]
   } deriving Show
 
 instance FromXML ListBucketResult where
   tagFromXML _   = s3qname "ListBucketResult"
   parseXML_ = withChildren $ do
-    lbrMetadata       <- unbounded (parseXML' (s3qname "Metadata") (withChildren pMetadataEntry))
-    lbrName           <- one (s3_xsd'string "Name")
-    lbrPrefix         <- ObjKey <$> one (s3_xsd'string "Prefix")
-    lbrMarker         <- ObjKey <$> one (s3_xsd'string "Marker")
-    lbrNextMarker     <- fmap ObjKey <$> maybeOne (s3_xsd'string "NextMarker")
-    lbrMaxKeys        <- one (s3_xsd'int "MaxKeys")
-    lbrDelimiter      <- fmap T.head <$> maybeOne (s3_xsd'string "Delimiter")
-    lbrIsTruncated    <- one (s3_xsd'boolean "IsTruncated")
-    lbrEncodingType   <- maybeOne (s3_xsd'string "EncodingType")
-    lbrContents       <- unbounded parseXML
-    lbrCommonPrefixes <- fmap unCommonPrefixes <$> unbounded parseXML
+      lbrMetadata       <- unbounded (parseXML' (s3qname "Metadata") (withChildren pMetadataEntry))
+      lbrName           <- one (s3_xsd'string "Name")
 
-    pure LBR{..}
+      -- we need this information early on as it affects the decoding of
+      -- ObjKey values; so let's read-ahead
+      tmp               <- aheadMaybeOne ((== s3qname "EncodingType") . X.elName)
+                                         (s3_xsd'string "EncodingType")
 
+      lbrEncodingTypeUrl <- case tmp :: Maybe Text of
+                              Just "url" -> pure True
+                              Nothing    -> pure False
+                              Just _     -> failP "unsupported <EncodingType> encoutered"
 
--- | Basic @List Objects@ service call
+      lbrPrefix         <- one (s3'ObjKey "Prefix" lbrEncodingTypeUrl)
+      lbrMarker         <- one (s3'ObjKey "Marker" lbrEncodingTypeUrl)
+      lbrNextMarker     <- maybeOne (s3'ObjKey "NextMarker" lbrEncodingTypeUrl)
+      lbrMaxKeys        <- one (s3_xsd'int "MaxKeys")
+      lbrDelimiter      <- fmap T.head <$> maybeOne (s3_xsd'string "Delimiter")
+      lbrIsTruncated    <- one (s3_xsd'boolean "IsTruncated")
+      lbrContents       <- unbounded (parseXML' (s3qname "Contents") $
+                                       withChildren (pObjMetaInfo lbrEncodingTypeUrl))
+      lbrCommonPrefixes <- unbounded (parseXML' (s3qname "CommonPrefixes") $
+                                       withChildren (pCommonPrefixes lbrEncodingTypeUrl))
+
+      pure LBR{..}
+    where
+      pCommonPrefixes urlEnc = one (s3'ObjKey "Prefix" urlEnc)
+
+-- | Primitive operation for list objects
 --
--- See also 'listObjectsChunk
+-- This operation corresponds to a single HTTP service request
+--
+-- The 'listObjectsChunk' and 'listObjects' operations build on this primitive building block.
 listObjectsChunk :: Connection
                  -> Credentials
                  -> BucketId
@@ -586,18 +615,19 @@ listObjectsChunk :: Connection
                  -> ObjKey     -- ^ marker (use 'isNullObjKey' if none)
                  -> Word16     -- ^ max-keys (set @0@ to use default which is usually @1000@)
                  -> IO (ObjKey,[ObjMetaInfo],[ObjKey]) -- ^ @(next-marker, objects, prefixes)@
-listObjectsChunk conn creds bid pfx delim marker maxKeys = do
-    now <- getCurrentTime
-
+listObjectsChunk conn creds bid pfx delim marker maxKeys = withAWSHeaders conn $ \awsh -> do
     let q = HC.buildRequest1 $
-              setAWSHeaders HC.GET (bid,nullObjKey,qry) ("",noCType,now) [] creds
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.GET
+                , ahdrUrlPath       = bucketUrlPath bid
+                , ahdrUrlQuery      = urlq
+                }
 
     (resp,mtmp) <- doHttpReqXml conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       200 -> pure ()
-      403 -> throwIO AccessDenied
-      _   -> throwUnexpectedXmlResp resp (fromMaybe dummyEl mtmp)
+      _   -> throwUnexpectedXmlResp resp mtmp
 
     LBR{..} <- case maybe (Left "empty body") parseXML mtmp of
       Right lbr -> pure (lbr :: ListBucketResult)
@@ -612,7 +642,7 @@ listObjectsChunk conn creds bid pfx delim marker maxKeys = do
     unless (lbrIsTruncated /= isNullObjKey nextMarker) $
       throwProtoFail "NextMarker and isTruncated inconsistent"
 
-    unless (nextMarker == nextMarker') $ do
+    unless (nextMarker == nextMarker') $
       throwProtoFail "NextMarker inconsistent" -- should never happen
 
     evaluate (force (nextMarker,lbrContents,lbrCommonPrefixes))
@@ -621,14 +651,16 @@ listObjectsChunk conn creds bid pfx delim marker maxKeys = do
     -- to support pureing more than 1000 entries (which is the
     -- default anyway)
 
-    -- TODO: percent encode
-    qryparms = [ "prefix="    <> urlEncodeObjKey pfx | not (isNullObjKey pfx) ] <>
-               [ "delimiter=" <> urlEncodeObjKey (ObjKey (TS.singleton d)) | Just d <- [delim] ] <>
-               [ "marker="    <> urlEncodeObjKey marker | not (isNullObjKey marker) ] <>
-               [ "max-keys="  <> BC8.pack (show maxKeys) | maxKeys > 0 ]
-               -- [ "encoding-type=url" ]
-    qry | null qryparms = mempty
-        | otherwise = "?" <> BC8.intercalate "&" qryparms
+    -- NB: keep this alphabetically sorted
+    qryparms = mconcat
+      [ [ "delimiter=" <> urlEncode True (BC8.singleton d) | Just d <- [delim] ]
+      , [ "encoding-type=url" | s3cfgEncodingUrl (s3connCfg conn) ]
+      , [ "marker="    <> urlEncodeObjKeyQry marker | not (isNullObjKey marker) ]
+      , [ "max-keys="  <> BC8.pack (show maxKeys) | maxKeys > 0 ]
+      , [ "prefix="    <> urlEncodeObjKeyQry pfx | not (isNullObjKey pfx) ]
+      ]
+    urlq | null qryparms = mempty
+         | otherwise = "?" <> BC8.intercalate "&" qryparms
 
 -- | Access permissions (aka /Canned ACLs/)
 --
@@ -641,7 +673,9 @@ data Acl = AclPrivate
          | AclPublicRead
          | AclPublicReadWrite
          | AclPublicAuthenticatedRead
-         deriving Show
+         deriving (Show,Typeable,Generic)
+
+instance NFData Acl
 
 acl2str :: Acl -> ByteString
 acl2str acl = case acl of
@@ -652,9 +686,10 @@ acl2str acl = case acl of
 
 
 data CopyObjectResult = CopyObjectResult
-  { corLastModified :: UTCTime
-  , corETag :: ETag
+  { _corLastModified :: UTCTime
+  , corETag          :: ETag
   } deriving Show
+
 
 instance FromXML CopyObjectResult where
   tagFromXML _ = s3qname "CopyObjectResult"
@@ -670,32 +705,25 @@ copyObject :: Connection
            -> (BucketId,ObjKey) -- ^ source object to copy
            -> Maybe Acl
            -> IO ETag
-copyObject conn creds bid objkey (srcBid,srcObjKey) macl = do
-    now <- getCurrentTime
-
-    let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.PUT (bid,objkey,mempty) (cmd5,noCType,now) hdrs creds
-              -- forM_ mcond setConditionHeader
-              HC.setContentLength 0
+copyObject conn creds bid objkey (srcBid,srcObjKey) macl = withAWSHeaders conn $ \awsh -> do
+    let q = HC.buildRequest1 $
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.PUT
+                , ahdrUrlPath       = objUrlPath bid objkey
+                , ahdrExtraHeaders  = hdrs
+                }
+              -- TODO: forM_ mcond setConditionHeader
 
     (resp, mtmp) <- doHttpReqXml conn q HC.emptyBody
 
     case (HC.getStatusCode resp,mtmp) of
-      (200,Just x) -> case parseXML x of
-        Right v  -> pure (corETag v)
-        Left _   -> throwUnexpectedXmlResp resp x
-
-      (403,_) -> throwIO AccessDenied
-
-      (_,Nothing) -> throwUnexpectedResp resp mempty
-      (_,Just x)  -> throwUnexpectedXmlResp resp x
+      (200,Just x) | Right v <- parseXML x -> pure (corETag v)
+      _ -> throwUnexpectedXmlResp resp mtmp
   where
-    hdrs = ("x-amz-copy-source", mkUrlPath (srcBid,srcObjKey,mempty))
+    hdrs = ("x-amz-copy-source", objUrlPath srcBid srcObjKey)
            : case macl of
                Nothing  -> []
                Just acl -> [("x-amz-acl", acl2str acl)]
-
-    cmd5 = B64.encode (MD5.hash mempty) -- RFC1864
 
 
 -- | @PUT@ Object
@@ -703,49 +731,54 @@ putObject :: Connection
           -> Credentials
           -> BucketId
           -> ObjKey        -- ^ Object key
-          -> ByteString    -- ^ Object payload data
+          -> BL.ByteString -- ^ Object payload data
           -> CType         -- ^ @content-type@ (e.g. @application/binary@); see also 'noCType'
           -> Maybe Acl
           -> IO ETag
-putObject conn creds bid objkey objdata ctype macl = maybe undefined id <$> putObjectX conn creds bid objkey objdata ctype macl Nothing
+putObject conn creds bid objkey objdata ctype macl
+  = fromMaybe undefined <$> putObjectX conn creds bid objkey objdata ctype macl Nothing
 
 putObjectCond :: Connection
               -> Credentials
               -> BucketId
               -> ObjKey        -- ^ Object key
-              -> ByteString    -- ^ Object payload data
+              -> BL.ByteString -- ^ Object payload data
               -> CType         -- ^ @content-type@ (e.g. @application/binary@); see also 'noCType'
               -> Maybe Acl
               -> Condition
               -> IO (Maybe ETag)
-putObjectCond conn creds bid objkey objdata ctype macl cond = putObjectX conn creds bid objkey objdata ctype macl (Just cond)
+putObjectCond conn creds bid objkey objdata ctype macl cond
+  = putObjectX conn creds bid objkey objdata ctype macl (Just cond)
 
 -- common codepath
 putObjectX :: Connection
             -> Credentials
             -> BucketId
             -> ObjKey
-            -> ByteString
+            -> BL.ByteString
             -> CType
             -> Maybe Acl
             -> Maybe Condition
             -> IO (Maybe ETag)
-putObjectX conn creds bid objkey objdata ctype macl mcond = do
-    now <- getCurrentTime
-
+putObjectX conn creds bid objkey objdata ctype macl mcond = withAWSHeaders conn $ \awsh -> do
     let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.PUT (bid,objkey,mempty) (cmd5,ctype,now) hdrs creds
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.PUT
+                , ahdrUrlPath       = objUrlPath bid objkey
+                , ahdrContentType   = ctype
+                , ahdrContentHashes = Just (md5,sha256,BL.length objdata)
+                , ahdrExtraHeaders  = hdrs
+                }
+
               -- sadly, `setHeader "Last-Modified" ...` doesn't seem have any effect
               forM_ mcond setConditionHeader
-              HC.setContentLength (fromIntegral $ BS.length objdata)
 
-    (resp, bs) <- doHttpReq conn q (bsBody objdata)
+    (resp, bs) <- doHttpReq True conn q (bsBody objdata)
 
     case HC.getStatusCode resp of
       200 -> case mkETag <$> HC.getHeader resp "ETag" of
                Just x  -> pure (Just x)
                Nothing -> throwProtoFail "ETag"
-      403 -> throwIO AccessDenied
       412 | Just _ <- mcond -> pure Nothing
       _   -> throwUnexpectedResp resp bs
   where
@@ -753,30 +786,31 @@ putObjectX conn creds bid objkey objdata ctype macl mcond = do
              Nothing  -> []
              Just acl -> [("x-amz-acl", acl2str acl)]
 
-    cmd5 = B64.encode (MD5.hash objdata) -- RFC1864
+    md5    = md5hash    objdata
+    sha256 = sha256hash objdata
 
-    bsBody :: ByteString -> Streams.OutputStream Builder.Builder -> IO ()
-    bsBody bs = Streams.write (Just (Builder.byteString bs))
+    bsBody :: BL.ByteString -> Streams.OutputStream Builder.Builder -> IO ()
+    bsBody bs = Streams.write (Just (Builder.lazyByteString bs))
 
 -- | @GET@ Object
 getObject :: Connection
           -> Credentials
           -> BucketId
           -> ObjKey        -- ^ Object key
-          -> IO (ETag, CType, ByteString)
-getObject conn creds bid objkey = do
-    now <- getCurrentTime
+          -> IO (ETag, CType, BL.ByteString)
+getObject conn creds bid objkey = withAWSHeaders conn $ \awsh -> do
+    let q = HC.buildRequest1 $
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.GET
+                , ahdrUrlPath       = objUrlPath bid objkey
+                }
 
-    let q = HC.buildRequest1 $ do
-          setAWSHeaders HC.GET (bid,objkey,mempty) (mempty,noCType,now) [] creds
-
-    (resp, bs) <- doHttpReq conn q HC.emptyBody
+    (resp, bs) <- doHttpReq False conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       200 -> case mkETag <$> HC.getHeader resp "ETag" of
                Just x  -> pure (x, getCT resp, bs)
                Nothing -> throwProtoFail "ETag"
-      403 -> throwIO AccessDenied
       _   -> throwUnexpectedResp resp bs
 
 getObjectCond :: Connection
@@ -784,15 +818,16 @@ getObjectCond :: Connection
               -> BucketId
               -> ObjKey        -- ^ Object key
               -> Condition
-              -> IO (Maybe (ETag, CType, ByteString))
-getObjectCond conn creds bid objkey cond = do
-    now <- getCurrentTime
-
+              -> IO (Maybe (ETag, CType, BL.ByteString))
+getObjectCond conn creds bid objkey cond = withAWSHeaders conn $ \awsh -> do
     let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.GET (bid,objkey,mempty) (mempty,noCType,now) [] creds
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.GET
+                , ahdrUrlPath       = objUrlPath bid objkey
+                }
               setConditionHeader cond
 
-    (resp, bs) <- doHttpReq conn q HC.emptyBody
+    (resp, bs) <- doHttpReq False conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       200 -> case mkETag <$> HC.getHeader resp "ETag" of
@@ -802,181 +837,99 @@ getObjectCond conn creds bid objkey cond = do
           | IfNotExists   <- cond -> pure Nothing
       412 | IfMatch     _ <- cond -> pure Nothing
           | IfExists      <- cond -> pure Nothing -- non-sensical
-      403 -> throwIO AccessDenied
       _   -> throwUnexpectedResp resp bs
 
 -- | @DELETE@ Object
 deleteObject :: Connection -> Credentials -> BucketId -> ObjKey -> IO ()
-deleteObject conn creds bid objkey = do
-    now <- getCurrentTime
+deleteObject conn creds bid objkey = withAWSHeaders conn $ \awsh -> do
+    let q = HC.buildRequest1 $
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.DELETE
+                , ahdrUrlPath       = objUrlPath bid objkey
+                }
 
-    let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.DELETE (bid,objkey,mempty) (mempty,noCType,now) [] creds
-
-    (resp, bs) <- doHttpReq conn q HC.emptyBody
+    (resp, bs) <- doHttpReq True conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       204 -> pure ()
-      403 -> throwIO AccessDenied
       _   -> throwUnexpectedResp resp bs
 
 
 deleteObjectCond :: Connection -> Credentials -> BucketId -> ObjKey -> Condition -> IO Bool
-deleteObjectCond conn creds bid objkey cond = do
-    now <- getCurrentTime
-
+deleteObjectCond conn creds bid objkey cond = withAWSHeaders conn $ \awsh -> do
     let q = HC.buildRequest1 $ do
-              setAWSHeaders HC.DELETE (bid,objkey,mempty) (mempty,noCType,now) [] creds
+              setAWSRequest creds awsh
+                { ahdrMethod        = HC.DELETE
+                , ahdrUrlPath       = objUrlPath bid objkey
+                }
               setConditionHeader cond
 
-    (resp, bs) <- doHttpReq conn q HC.emptyBody
+    (resp, bs) <- doHttpReq True conn q HC.emptyBody
 
     case HC.getStatusCode resp of
       204 -> pure True
-      403 -> throwIO AccessDenied
       412 -> pure False
       _   -> throwUnexpectedResp resp bs
 
--- | Wrapper around 'genSignatureV2', sets basic AWS headers
-setAWSHeaders :: HC.Method
-              -> (BucketId,ObjKey,ByteString)        -- constructs url-path
-              -> (ByteString,CType,UTCTime)  -- core headers: md5,ctype,date
-              -> [(ByteString,ByteString)]           -- extra headers
-              -> Credentials
-              -> HC.RequestBuilder ()
-setAWSHeaders verb urlp@(bid,objkey,_) (cmd5,CType ctype0,date0) amzhdrs creds@(Credentials akey _) = do
-    HC.http verb (mkUrlPath urlp)
-    HC.setHeader "Date" date
-    unless (BS.null ctype) $ HC.setContentType ctype
-    unless (BS.null cmd5)  $ HC.setHeader "Content-MD5" cmd5
-    forM_ amzhdrs (uncurry HC.setHeader)
-    unless (BS.null akey) $
-      HC.setHeader "Authorization" ("AWS " <> akey <> ":" <> signature)
-  where
-    signature = genSignatureV2 verb bid objkey (cmd5,ctype,date) amzhdrs creds
-
-    date = formatRFC1123 date0
-    ctype = TS.toByteString ctype0
-
-
-mkUrlPath :: (BucketId, ObjKey, ByteString) -> ByteString
-mkUrlPath (BucketId bucketId, objkey, query) = p <> query
-  where
-    p = case (BSS.null bucketId, isNullObjKey objkey) of
-      (True, True)   -> "/"
-      (False, True)  -> "/" <> BSS.fromShort bucketId
-      (True, False)  -> error "mkUrlPath: invalid argument"
-      (False, False) -> "/" <> BSS.fromShort bucketId <> "/" <> urlEncodeObjKey objkey
-
-
-{- | Compute S3 v2 signature
-@
-Authorization = "AWS" + " " + AWSAccessKeyId + ":" + Signature;
-
-Signature = Base64( HMAC-SHA1( YourSecretAccessKeyID, UTF-8-Encoding-Of( StringToSign ) ) );
-
-StringToSign = HTTP-Verb + "\n" +
-	Content-MD5 + "\n" +
-	Content-Type + "\n" +
-	Date + "\n" +
-	CanonicalizedAmzHeaders +
-	CanonicalizedResource;
-
-CanonicalizedResource = [ "/" + Bucket ] +
-	<HTTP-Request-URI, from the protocol name up to the query string> +
-	[ subresource, if present. For example "?acl", "?location", "?logging", or "?torrent"];
-
-CanonicalizedAmzHeaders = ...
-@
-
--}
-genSignatureV2 :: HC.Method -> BucketId -> ObjKey -> (ByteString,ByteString,ByteString) -> [(ByteString,ByteString)] -> Credentials -> ByteString
-genSignatureV2 verb bid objkey (cmd5,ctype,date) amzhdrs (Credentials _ skey) = B64.encode sig
-  where
-    sig = SHA1.hmac skey msg
-    msg = BS.intercalate "\n" $
-              [ verb'
-              , cmd5
-              , ctype
-              , date
-              ] <>
-              [ k <> ":" <> v | (k,v) <- List.sort amzhdrs ] <>
-              [ mkUrlPath (bid, objkey, mempty) ]
-
-    verb' = case verb of
-        HC.PUT    -> "PUT"
-        HC.GET    -> "GET"
-        HC.HEAD   -> "HEAD"
-        HC.DELETE -> "DELETE"
-        _         -> error "genSignatureV2: unsupported verb"
-
-
-formatRFC1123 :: UTCTime -> ByteString
-formatRFC1123 = BC8.pack . DT.formatTime defaultTimeLocale "%a, %d %b %Y %X GMT"
-
-newtype CommonPrefixes = CommonPrefixes { unCommonPrefixes :: ObjKey }
-
-instance FromXML CommonPrefixes where
-  tagFromXML _   = s3qname "CommonPrefixes"
-  parseXML_ = withChildren $ do
-    k <- one (s3_xsd'string "Prefix")
-    pure (CommonPrefixes (ObjKey k))
-
+-- | Bucket metadata reported by 'listBuckets'
 data BucketInfo = BucketInfo !BucketId !UTCTime
-                deriving Show
+                deriving (Show,Typeable,Generic)
+
+instance NFData BucketInfo
 
 instance FromXML BucketInfo where
   tagFromXML _   = s3qname "Bucket"
-  parseXML_ = withChildren $ do
+  parseXML_ = withChildren $
     BucketInfo <$> one (s3_xsd'string "Name")
                <*> one (s3_xsd'dateTime "CreationDate")
 
-instance FromXML ObjMetaInfo where
-    tagFromXML _   = s3qname "Contents"
-    parseXML_ = withChildren $ do
-        omiKey <- ObjKey <$> one (s3_xsd'string "Key")
-        omiLastModified <- one (s3_xsd'dateTime "LastModified")
 
-        omiEtag <- mkETag <$> one (s3_xsd'string "ETag")
-        -- -- sometimes the reported MD5 is computed over chunks, in
-        -- -- which case the etag has a "-<num>" suffix. For now, we just
-        -- -- map those to the special zero MD5 as we can't do anything
-        -- -- sensible with it anyway (but we may want to be able to
-        -- -- detect that the MD5 reported was not a proper MD5)
+pObjMetaInfo :: Bool -> P ObjMetaInfo
+pObjMetaInfo urlEnc = do
+    omiKey <- one (s3'ObjKey "Key" urlEnc)
+    omiLastModified <- one (s3_xsd'dateTime "LastModified")
 
-        omiSize <- one (s3_xsd'long "Size")
+    omiEtag <- mkETag <$> one (s3_xsd'string "ETag")
+    -- -- sometimes the reported MD5 is computed over chunks, in
+    -- -- which case the etag has a "-<num>" suffix. For now, we just
+    -- -- map those to the special zero MD5 as we can't do anything
+    -- -- sensible with it anyway (but we may want to be able to
+    -- -- detect that the MD5 reported was not a proper MD5)
 
-        let sc = \case
-              "DEEP_ARCHIVE"       -> Just ()
-              "GLACIER"            -> Just ()
-              "INTELLIGENT_TIERING"-> Just ()
-              "ONEZONE_IA"         -> Just ()
-              "REDUCED_REDUNDANCY" -> Just ()
-              "STANDARD"           -> Just ()
-              "STANDARD_IA"        -> Just ()
-              "UNKNOWN"            -> Just ()
-              _                    -> Nothing -- FIXME
+    omiSize <- one (s3_xsd'long "Size")
 
-        let s3_storageClass = s3_xsd'enum "StorageClass" sc -- StorageClass / TODO
+    let sc = \case
+          "DEEP_ARCHIVE"       -> Just ()
+          "GLACIER"            -> Just ()
+          "INTELLIGENT_TIERING"-> Just ()
+          "ONEZONE_IA"         -> Just ()
+          "REDUCED_REDUNDANCY" -> Just ()
+          "STANDARD"           -> Just ()
+          "STANDARD_IA"        -> Just ()
+          "UNKNOWN"            -> Just ()
+          _                    -> Nothing -- FIXME
 
-        -- NB: some implementations have (optional) <Owner> and
-        -- (mandatory) <StorageClass> swapped in their schema
-        -- (i.e. <StorageClass> not being last); so we tolerate both
-        -- orderings
+    let s3_storageClass = s3_xsd'enum "StorageClass" sc -- StorageClass / TODO
 
-        msc <- maybeOne s3_storageClass
-        (own,()) <- case msc of
-          Nothing  -> (,) <$> (Just <$> one parseXML) <*> one s3_storageClass
-          Just sc' -> (,) <$> maybeOne parseXML <*> pure sc'
+    -- NB: some implementations have (optional) <Owner> and
+    -- (mandatory) <StorageClass> swapped in their schema
+    -- (i.e. <StorageClass> not being last); so we tolerate both
+    -- orderings
 
-        let omiOwnerId = fmap ownerID own
+    msc <- maybeOne s3_storageClass
+    (own,()) <- case msc of
+      Nothing  -> (,) <$> (Just <$> one parseXML) <*> one s3_storageClass
+      Just sc' -> (,) <$> maybeOne parseXML <*> pure sc'
 
-        pure $! (OMI {..})
+    let omiOwnerId = fmap ownerID own
+
+    pure $! (OMI {..})
+
 
 ----------------------------------------------------------------------------
 
-data Owner = Owner { ownerID :: ShortText
-                   , ownerDisplayName :: Maybe ShortText
+data Owner = Owner { ownerID           :: ShortText
+                   , _ownerDisplayName :: Maybe ShortText
                    } deriving Show
 
 instance FromXML Owner where
@@ -986,19 +939,7 @@ instance FromXML Owner where
           <*> maybeOne (s3_xsd'string "DisplayName")
 
 
-data ListAllMyBucketsResult = ListAllMyBucketsResult [BucketInfo]
-
-{-
-
-
-<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">
-<Owner><ID>hackage</ID><DisplayName>hackage</DisplayName></Owner>
-  <Buckets>
-    <Bucket><Name>hackage-mirror</Name><CreationDate>2018-06-21T23:14:36.660Z</CreationDate></Bucket>
-  </Buckets>
-</ListAllMyBucketsResult>
-
--}
+newtype ListAllMyBucketsResult = ListAllMyBucketsResult [BucketInfo]
 
 instance FromXML ListAllMyBucketsResult where
   tagFromXML _ = s3qname "ListAllMyBucketsResult"
@@ -1018,7 +959,7 @@ instance FromXML Buckets where
 newtype Error = Error ShortText
               deriving Show
 
-{- NB: The <Error> response element has no namespace
+{- NB: The <Error> response element has no namespace and its schema is not openly documented; the first sub-element is always a <Code> text-element.
 
 <Error>
   <Code>BucketNotEmpty</Code>
@@ -1030,175 +971,9 @@ newtype Error = Error ShortText
 -}
 
 instance FromXML Error where
-  tagFromXML _ = (X.unqual "Error")
+  tagFromXML _ = X.unqual "Error"
 
   parseXML_ = withChildren $ do
     code <- one (xsd'string (X.unqual "Code"))
     void unboundedAny -- skip the rest
     pure (Error code)
-
-----------------------------------------------------------------------------
--- XML parsing
-
-s3qname :: X.LName -> X.QName
-s3qname n = X.QName { X.qLName = n, X.qURI = s3xmlns, X.qPrefix = Nothing }
-  where
-    s3xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
-
-showQN :: X.QName -> String
-showQN (X.QName (X.LName ln) ns@(X.URI ns') _)
-  | X.isNullURI ns = TS.unpack ln
-  | otherwise      = mconcat [ "{", TS.unpack ns', "}", TS.unpack ln ]
-
-xsd'string :: XsdString t => X.QName -> X.Element -> Either String t
-xsd'string elNameExpected el
-  | X.elName el /= elNameExpected
-  = Left ("expected <" <> showQN elNameExpected <> "> but got <" <> showQN (X.elName el) <> "> instead")
-  | not (null (X.elChildren el)) = Left ("<" <> showQN (X.elName el) <> "> schema violation")
-  | otherwise = Right (fromXsdString $ X.strContent el)
-
-xsd'dateTime :: X.QName -> X.Element -> Either String UTCTime
-xsd'dateTime n el = do
-  t <- xsd'string n el
-  case DT.parseTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ" (T.unpack t) of
-    Nothing -> Left ("<" <> showQN (X.elName el) <> "> failed to decode xsd:dateTime")
-    Just dt -> pure dt
-
-xsd'long :: X.QName -> X.Element -> Either String Int64
-xsd'long qn el = do
-  t <- xsd'string qn el
-  case readMaybe (T.unpack t) of
-    Nothing -> Left ("<" <> showQN (X.elName el) <> "> failed to decode xsd:long")
-    Just dt -> pure dt
-
-xsd'int :: X.QName -> X.Element -> Either String Int32
-xsd'int qn el = do
-  t <- xsd'string qn el
-  case readMaybe (T.unpack t) of
-    Nothing -> Left ("<" <> showQN (X.elName el) <> "> failed to decode xsd:int")
-    Just dt -> pure dt
-
-xsd'enum :: X.QName -> (T.Text -> Maybe a) -> X.Element -> Either String a
-xsd'enum ln f el = do
-  t <- xsd'string ln el
-  case f t of
-    Nothing -> Left ("<" <> showQN (X.elName el) <> "> failed to decode xsd:string enumeration")
-    Just dt -> pure dt
-
-xsd'boolean :: X.QName -> X.Element -> Either String Bool
-xsd'boolean ln el = do
-  t <- xsd'string ln el
-  case t :: T.Text of
-    "true"  -> pure True
-    "1"     -> pure True
-    "false" -> pure False
-    "0"     -> pure False
-    _       -> Left ("<" <> showQN (X.elName el) <> "> failed to decode xsd:boolean enumeration")
-
-class XsdString a where fromXsdString :: T.Text -> a
-instance XsdString T.Text where fromXsdString = id
-instance XsdString ShortText where fromXsdString = TS.fromText
-instance XsdString ShortByteString where fromXsdString = TS.toShortByteString . TS.fromText
-instance XsdString ByteString where fromXsdString = T.encodeUtf8
-
-s3_xsd'string :: XsdString t => X.LName -> X.Element -> Either String t
-s3_xsd'string = xsd'string . s3qname
-
-s3_xsd'dateTime :: X.LName -> X.Element -> Either String UTCTime
-s3_xsd'dateTime = xsd'dateTime . s3qname
-
-s3_xsd'long :: X.LName -> X.Element -> Either String Int64
-s3_xsd'long = xsd'long . s3qname
-
-s3_xsd'int :: X.LName -> X.Element -> Either String Int32
-s3_xsd'int = xsd'int . s3qname
-
-s3_xsd'boolean :: X.LName -> X.Element -> Either String Bool
-s3_xsd'boolean = xsd'boolean . s3qname
-
-s3_xsd'enum :: X.LName -> (T.Text -> Maybe a) -> X.Element -> Either String a
-s3_xsd'enum ln = xsd'enum (s3qname ln)
-
-class FromXML a where
-    parseXML_  :: X.Element -> Either String a
-    tagFromXML :: Proxy a -> X.QName
-
-parseXML :: forall a . FromXML a => X.Element -> Either String a
-parseXML = parseXML' elNameExpected parseXML_
-  where
-    elNameExpected = tagFromXML (Proxy :: Proxy a)
-
-parseXML' :: X.QName -> (X.Element -> Either String a) -> X.Element -> Either String a
-parseXML' elNameExpected p el = do
-    unless (X.elName el == elNameExpected) $
-      Left ("expected <" <> showQN elNameExpected <> "> but got <" <> showQN (X.elName el) <> "> instead")
-    p el
-
-
-decodeXML :: forall a . FromXML a => ByteString -> Either String a
-decodeXML bs = case filterContent tag <$> X.parseXML (T.decodeUtf8 bs) of
-                 Right [x] -> parseXML x
-                 _   -> Left ("decodeXML: failed to locate " <> show tag)
-  where
-    tag = tagFromXML (Proxy :: Proxy a)
-
-filterContent :: X.QName -> [X.Content] -> [X.Element]
-filterContent q = filter ((== q) . X.elName) . X.onlyElems
-
--- withChildren :: ([X.Element] -> Either String a) -> X.Element -> Either String a
--- withChildren h el
---   | not (T.all isSpace (X.strContent el)) = Left ("<" <> showQN (X.elName el) <> "> schema violation")
---   | otherwise = h (X.elChildren el)
-
-withChildren :: P a -> X.Element -> Either String a
-withChildren h el
-  | not (T.all isSpace (X.strContent el)) = Left ("<" <> showQN (X.elName el) <> "> schema violation")
-  | otherwise = go (X.elChildren el)
-  where
-    go els0 = do
-      (els1,x) <- runP_ h els0
-      case els1 of
-        [] -> pure x
-        e1:_ -> Left ("unexpected " <> showQN (X.elName e1))
-
-one :: (X.Element -> Either String a) -> P a
-one p = P $ \case
-  []       -> Left "premature end-tag"
-  el1:els  -> (,) els <$> p el1
-
-maybeOne :: (X.Element -> Either String a) -> P (Maybe a)
-maybeOne p = (Just <$> one p) <|> pure Nothing
-
-unbounded :: (X.Element -> Either String a) -> P [a]
-unbounded p = many (one p)
-
--- | More efficient variant of @'unbounded' 'pure'@
-unboundedAny :: P [X.Element]
-unboundedAny = P $ \els -> pure ([],els)
-
--- unbounded1 :: (X.Element -> Either String a) -> P [a] -- NonEmpty
--- unbounded1 p = some (one p)
-
-newtype P a = P { runP_ :: [X.Element] -> Either String ([X.Element], a) }
-
-instance Functor P where
-  fmap g (P m) = P (fmap (fmap (fmap g)) m)
-
-instance Applicative P where
-  pure x = P $ \cs -> Right (cs,x)
-  (<*>) = ap
-
-instance Monad P where
-  p1 >>= p2 = P $ \cs0 -> do (cs1,a) <- runP_ p1 cs0
-                             runP_ (p2 a) cs1
-
-instance Alternative P where
-  empty = failP "empty"
-  p1 <|> p2 = P $ \cs0 -> either (\_ -> runP_ p2 cs0) pure (runP_ p1 cs0)
-
-failP :: String -> P a
-failP msg = P $ \_ -> Left msg
-
--- hack; fixme
-dummyEl :: X.Element
-dummyEl = X.node (X.unqual "empty") ()
